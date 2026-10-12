@@ -1,0 +1,35 @@
+# GUIConnect project file. Copy to config.yaml and edit.
+server:
+  endpoint: opc.tcp://0.0.0.0:4840/kepclone
+  # Any of: NoSecurity, Basic256Sha256_Sign, Basic256Sha256_SignAndEncrypt,
+  # Aes128Sha256RsaOaep_SignAndEncrypt, Aes256Sha256RsaPss_SignAndEncrypt, ...
+  security: [NoSecurity, Basic256Sha256_SignAndEncrypt]
+  pki_dir: pki              # server cert/key created here on first start
+  anonymous: true           # anonymous clients may connect and read
+  anonymous_write: false    # anonymous clients may NOT write
+  users:                    # writes need one of these logins
+    # scada: "<output of: python -m kepclone hash-password>"
+
+channels:
+  - name: Line1             # no '.' in channel/device names
+    driver: logix
+    devices:
+      - name: Press1
+        path: 192.168.1.10/0      # IP/backplane slot of the controller
+        scan_ms: 1000
+        include: ["*"]            # fnmatch on top-level tag names, case-insensitive
+        exclude: ["_*"]
+        program_tags: false       # true also serves Program:<name>.<tag>
+        writable: ["HMI_*"]       # fnmatch on tag paths, e.g. HMI_Recipe.Speed
+
+  - name: RTUs
+    driver: dnp3                  # DNP3 master over TCP, read-only
+    devices:
+      - name: Pump3
+        path: 10.0.5.20:20000     # host[:port], port defaults to 20000
+        outstation: 10            # RTU's DNP3 address
+        master: 1                 # our DNP3 address
+        scan_ms: 2000
+        names:                    # optional friendly names; other points appear as AI.7, BI.3, ...
+          TankLevel: AI.5         # types: BI DBI BO CTR FCTR AI AO
+          PumpRun: BI.0

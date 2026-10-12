@@ -1,0 +1,4 @@
+# asyncua pinned exactly: kepclone wraps its internal AttributeService.write
+asyncua==2.0.1
+pycomm3==1.2.16
+PyYAML==6.0.3
