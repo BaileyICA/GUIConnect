@@ -4,11 +4,13 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import getpass
+import json
 import logging
 import os
 import queue
 import subprocess
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +28,7 @@ REFRESH_MS = 500
 EVENT_ROWS = 2000
 DRIVER_NAMES = {"logix": "Allen-Bradley Logix (EtherNet/IP)", "dnp3": "DNP3 master (TCP)"}
 RED, GREEN, GREY, AMBER = "#c42b1c", "#107c10", "#767676", "#9d5d00"
+SNAPSHOT_EVERY_S = 30  # how often the online values are saved for the next offline start
 WRITE_TIMEOUT_S = 15  # the write queues behind the current poll on the device's I/O thread
 
 
@@ -179,6 +182,14 @@ def _plc_status(info: dict) -> tuple[str, str]:
     return (f"{mode}, no faults", GREEN if mode.endswith("RUN") else AMBER) if mode else ("", GREY)
 
 
+def _load_snapshot(path: Path) -> dict:
+    """Last saved online values: device key -> {"saved", "info", "tags": [[path, vtype, count, value, code, ts], ...]}."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
 def _address(driver: str, d: config_mod.DeviceConfig) -> str:
     if driver == "dnp3":
         return f"{d.path}  (outstation {d.outstation}, master {d.master})"
@@ -231,6 +242,9 @@ class App:
         self.info: dict[str, tuple] = {}  # tag path -> (vtype, count, writable), for the write dialog
         self.shown_kids: dict[str, tuple] = {}  # element/bit row iid -> (values, tag) shown
         self.shown_key = None
+        self.online = False
+        self.snap: dict = {}
+        self.snap_at = 0.0
         self.clients: list = []
         self.error_shown: Gateway | None = None
         self.log_queue: queue.Queue = queue.Queue()
@@ -295,6 +309,9 @@ class App:
             self.tree.tag_configure(tag, foreground=color)
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._refresh())
         self.tree.bind("<Double-1>", lambda e: self.change_address())
+        self.tree_menu = tk.Menu(self.tree, tearoff=False)
+        self.tree_menu.add_command(label="Go Online", command=self.toggle_online)
+        self.tree.bind("<Button-3>", self._tree_menu)
         top.add(left, weight=1)
 
         right = ttk.Frame(top)
@@ -374,9 +391,24 @@ class App:
             self.open_project(path)
 
     def reload(self) -> None:
-        self.open_project(self.path)
+        self.open_project(self.path, self.online)
 
-    def open_project(self, path) -> None:
+    def _tree_menu(self, event) -> None:
+        row = self.tree.identify_row(event.y)
+        if row:
+            self.tree.selection_set(row)
+        self.tree_menu.entryconfigure(0, label="Go Offline" if self.online else "Go Online")
+        self.tree_menu.tk_popup(event.x_root, event.y_root)
+
+    def toggle_online(self) -> None:
+        if self.online:
+            self._stop_gateway()  # saves the snapshot first
+            self.online = False
+        elif self.cfg:
+            self.online = True
+            self.gw = Gateway(self.cfg)
+
+    def open_project(self, path, online: bool = False) -> None:
         path = Path(path).resolve()
         try:
             cfg = config_mod.load(path)
@@ -400,10 +432,37 @@ class App:
         if self.dev_cfg:
             self.tree.selection_set(next(iter(self.dev_cfg)))
         log.info("project %s loaded", path)
-        self.gw = Gateway(cfg)
+        self.snap = _load_snapshot(path.with_suffix(".snapshot.json"))
+        self.online = online
+        self.gw = Gateway(cfg) if online else None
+
+    def _save_snapshot(self) -> None:
+        """Keep each device's current tag values, for the offline view of the next start."""
+        gw = self.gw
+        snap = gw.call(gw.overview) if gw else None
+        if not snap:
+            return
+        for key, s in snap[0].items():
+            tags = [
+                [path, vtype, count, last[0], int(last[1]), ts.isoformat() if ts else None]
+                for path, vtype, count, last, ts, _ in gw.call(gw.tags, key) or [] if last
+            ]
+            if any(t[4] == ua.StatusCodes.Good for t in tags):  # a device that never connected keeps its old snapshot
+                self.snap[key] = {"saved": datetime.now().isoformat(timespec="seconds"), "info": s[4], "tags": tags}
+        try:
+            self.path.with_suffix(".snapshot.json").write_text(json.dumps(self.snap, default=str), encoding="utf-8")
+        except OSError as e:
+            log.warning("snapshot not saved: %s", e)
+
+    def _offline_tags(self, key: str) -> list:
+        tags = []
+        for path, vtype, count, value, code, ts in self.snap.get(key, {}).get("tags", []):
+            tags.append((path, vtype, count, (value, code), datetime.fromisoformat(ts) if ts else None, False))
+        return tags
 
     def _stop_gateway(self) -> None:
         if self.gw:
+            self._save_snapshot()
             self.status.set("Stopping gateway…")
             self.root.update_idletasks()
             self.gw.stop()
@@ -429,6 +488,9 @@ class App:
         try:
             self._drain_log()
             self._refresh()
+            if self.gw and time.monotonic() - self.snap_at > SNAPSHOT_EVERY_S:
+                self.snap_at = time.monotonic()
+                self._save_snapshot()
         finally:
             self.root.after(REFRESH_MS, self._tick)
 
@@ -456,7 +518,7 @@ class App:
 
         for key in self.dev_cfg:
             s = devices.get(key)
-            state, tag = ("Connected", "up") if s and s[0] else ("Down", "down") if s else ("Stopped", "idle")
+            state, tag = ("Connected", "up") if s and s[0] else ("Down", "down") if s else ("Stopped" if gw else "Offline", "idle")
             if gw and gw.running and not snap:
                 state = "Starting"
             self.tree.item(key, values=(state,), tags=(tag,))
@@ -469,7 +531,10 @@ class App:
             self.nb.tab(self.client_tab, text=f"OPC UA Clients ({len(clients)})")
 
         if gw is None:
-            text, color = "No project loaded", GREY
+            text, color = (
+                ("Offline: showing the last saved values. Right-click the project to go online.", AMBER)
+                if self.cfg else ("No project loaded", GREY)
+            )
         elif gw.error:
             text, color = f"Gateway stopped: {gw.error}", RED
             if self.error_shown is not gw:
@@ -508,12 +573,13 @@ class App:
         f["Device"].set(sel[0])
         f["Driver"].set(DRIVER_NAMES.get(ch.driver, ch.driver))
         f["Address"].set(_address(ch.driver, d))
-        f["Status"].set("Connected" if s and s[0] else "Not connected" if s else "Stopped")
+        off = None if self.gw else self.snap.get(sel[0])
+        f["Status"].set("Connected" if s and s[0] else "Not connected" if s else f"Offline (values from {off['saved']})" if off else "Stopped")
         self.status_value.configure(foreground=GREEN if s and s[0] else RED)
         f["Scan time"].set(f"{s[2]:.0f} ms (configured {d.scan_ms} ms)" if s else f"configured {d.scan_ms} ms")
-        f["Tags"].set(str(s[3]) if s else "")
+        f["Tags"].set(str(s[3]) if s else str(len(off["tags"])) if off else "")
         f["Last error"].set((s[1] if s else "") or "-")
-        info = s[4] if s else {}
+        info = s[4] if s else off["info"] if off else {}
         text, color = _plc_status(info)
         f["PLC status"].set(text)
         self.plc_value.configure(foreground=color)
@@ -521,7 +587,7 @@ class App:
 
     def _refresh_tags(self, force: bool) -> None:
         key = self._selected_device()
-        tags = (self.gw.call(self.gw.tags, key) if key and self.gw else None) or []
+        tags = (self.gw.call(self.gw.tags, key) if self.gw else self._offline_tags(key)) if key else []
         needle = self.filter.get().strip().lower()
         rows, values, info = {}, {}, {}
         for path, vtype, count, last, ts, writable in tags:
