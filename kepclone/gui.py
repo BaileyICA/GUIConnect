@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+from dataclasses import replace
 import getpass
 import json
 import logging
@@ -242,7 +243,7 @@ class App:
         self.info: dict[str, tuple] = {}  # tag path -> (vtype, count, writable), for the write dialog
         self.shown_kids: dict[str, tuple] = {}  # element/bit row iid -> (values, tag) shown
         self.shown_key = None
-        self.online = False
+        self.online: str | None = None  # name of the channel that is online
         self.snap: dict = {}
         self.snap_at = 0.0
         self.clients: list = []
@@ -401,18 +402,36 @@ class App:
         row = self.tree.identify_row(event.y)
         if row:
             self.tree.selection_set(row)
-        self.tree_menu.entryconfigure(0, label="Go Offline" if self.online else "Go Online")
+        ch = self._selected_channel()
+        self.tree_menu.entryconfigure(
+            0, label=f"Go Offline ({self.online})" if self.online else f"Go Online ({ch})" if ch else "Go Online",
+            state="normal" if self.online or ch else "disabled",
+        )
         self.tree_menu.tk_popup(event.x_root, event.y_root)
+
+    def _selected_channel(self) -> str | None:
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        return sel[0][3:] if sel[0].startswith("ch:") else self.dev_cfg[sel[0]][0].name
+
+    def _live(self, key: str | None) -> Gateway | None:
+        """The gateway, if this device's channel is the one online."""
+        return self.gw if self.gw and key in self.dev_cfg and self.dev_cfg[key][0].name == self.online else None
+
+    def _go_online(self, name: str) -> None:
+        ch = next((c for c in self.cfg.channels if c.name == name), None)
+        self.online = ch.name if ch else None
+        self.gw = Gateway(replace(self.cfg, channels=[ch])) if ch else None
 
     def toggle_online(self) -> None:
         if self.online:
             self._stop_gateway()  # saves the snapshot first
-            self.online = False
-        elif self.cfg:
-            self.online = True
-            self.gw = Gateway(self.cfg)
+            self.online = None
+        elif self.cfg and (name := self._selected_channel()):
+            self._go_online(name)
 
-    def open_project(self, path, online: bool = False) -> None:
+    def open_project(self, path, online: str | None = None) -> None:
         path = Path(path).resolve()
         try:
             cfg = config_mod.load(path)
@@ -437,8 +456,9 @@ class App:
             self.tree.selection_set(next(iter(self.dev_cfg)))
         log.info("project %s loaded", path)
         self.snap = _load_snapshot(path.with_suffix(".snapshot.json"))
-        self.online = online
-        self.gw = Gateway(cfg) if online else None
+        self.online, self.gw = None, None
+        if online:
+            self._go_online(online)
 
     def _save_snapshot(self) -> None:
         """Keep each device's current tag values, for the offline view of the next start."""
@@ -522,8 +542,8 @@ class App:
 
         for key in self.dev_cfg:
             s = devices.get(key)
-            state, tag = ("Connected", "up") if s and s[0] else ("Down", "down") if s else ("Stopped" if gw else "Offline", "idle")
-            if gw and gw.running and not snap:
+            state, tag = ("Connected", "up") if s and s[0] else ("Down", "down") if s else ("Stopped" if self._live(key) else "Offline", "idle")
+            if self._live(key) and gw.running and not snap:
                 state = "Starting"
             self.tree.item(key, values=(state,), tags=(tag,))
 
@@ -577,7 +597,7 @@ class App:
         f["Device"].set(sel[0])
         f["Driver"].set(DRIVER_NAMES.get(ch.driver, ch.driver))
         f["Address"].set(_address(ch.driver, d))
-        off = None if self.gw else self.snap.get(sel[0])
+        off = None if self._live(sel[0]) else self.snap.get(sel[0])
         f["Status"].set("Connected" if s and s[0] else "Not connected" if s else f"Offline (values from {off['saved']})" if off else "Stopped")
         self.status_value.configure(foreground=GREEN if s and s[0] else RED)
         f["Scan time"].set(f"{s[2]:.0f} ms (configured {d.scan_ms} ms)" if s else f"configured {d.scan_ms} ms")
@@ -591,7 +611,7 @@ class App:
 
     def _refresh_tags(self, force: bool) -> None:
         key = self._selected_device()
-        tags = (self.gw.call(self.gw.tags, key) if self.gw else self._offline_tags(key)) if key else []
+        tags = (self.gw.call(self.gw.tags, key) if self._live(key) else self._offline_tags(key)) if key else []
         needle = self.filter.get().strip().lower()
         rows, values, info = {}, {}, {}
         for path, vtype, count, last, ts, writable in tags:
@@ -852,12 +872,12 @@ class App:
     def toggle_bit(self) -> None:
         path = self.table.focus()
         current = self._bit_value(path)
-        if current is not None and self.gw:
+        if current is not None and self._live(self.shown_key):
             self._write(self.shown_key, path, not current)
 
     def write_value(self) -> None:
         path, key = self.table.focus(), self.shown_key
-        if not path or not self.gw:
+        if not path or not self._live(key):
             return
         target = self._target(path)
         if not target:
