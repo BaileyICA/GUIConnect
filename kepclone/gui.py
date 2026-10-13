@@ -314,6 +314,7 @@ class App:
         self.tree_menu = tk.Menu(self.tree, tearoff=False)
         self.tree_menu.add_command(label="Go Online", command=self.toggle_online)
         self.tree_menu.add_command(label="Add Channel / Device…", command=self.add_device)
+        self.tree_menu.add_command(label="Properties…", command=self.change_address)
         self.tree.bind("<Button-3>", self._tree_menu)
         top.add(left, weight=1)
 
@@ -333,7 +334,7 @@ class App:
                 self.status_value = lbl
             if name == "PLC status":
                 self.plc_value = lbl
-        ttk.Button(info, text="Change Address…", command=self.change_address).grid(row=1, column=4, sticky="e")
+        ttk.Button(info, text="Properties…", command=self.change_address).grid(row=1, column=4, sticky="e")
         info.columnconfigure(1, weight=1)
         info.columnconfigure(3, weight=1)
 
@@ -651,28 +652,80 @@ class App:
     # ---- dialogs ---------------------------------------------------------------------
 
     def change_address(self) -> None:
+        """Edit every setting of the selected device (and its channel's name)."""
         key = self._selected_device()
         if not key:
             return
         ch, d = self.dev_cfg[key]
-        hint = "host or host:port, e.g. 10.0.5.20:20000" if ch.driver == "dnp3" else "IP/slot, e.g. 192.168.1.10/0"
-        new = simpledialog.askstring(
-            "Change Address",
-            f"Address of {key}\n({hint}).\n\nSaved to the project file; the gateway restarts to apply it.",
-            initialvalue=d.path, parent=self.root,
-        )
-        new = (new or "").strip()
-        if not new or new == d.path:
-            return
-        try:
-            config_mod.set_device_path(self.path, ch.name, d.name, new)
-        except (OSError, yaml.YAMLError, config_mod.ConfigError) as e:
-            messagebox.showerror("Change Address", f"Address not changed:\n\n{e}", parent=self.root)
-            return
-        log.info("%s address changed from %s to %s", key, d.path, new)
-        self.reload()
-        if key in self.dev_cfg:
-            self.tree.selection_set(key)
+        dnp3 = ch.driver == "dnp3"
+        join = ", ".join
+        win = tk.Toplevel(self.root)
+        win.title(f"Properties - {key}")
+        win.transient(self.root)
+        win.grab_set()
+        f = ttk.Frame(win, padding=12)
+        f.pack(fill="both", expand=True)
+        prog = tk.BooleanVar(value=d.program_tags)
+        names = tk.Text(f, width=40, height=4)
+        names.insert("1.0", "\n".join(f"{k} = {v}" for k, v in d.names.items()))
+        # (label, key, widget var/initial, default)
+        fields = [
+            ("Channel name", "channel", ch.name), ("Device name", "name", d.name),
+            ("Address (Logix: IP/slot, DNP3: host[:port])", "path", d.path), ("Scan time (ms)", "scan_ms", str(d.scan_ms)),
+            ("Include tags (comma separated)", "include", join(d.include)), ("Exclude tags", "exclude", join(d.exclude)),
+            ("Writable tags", "writable", join(d.writable)),
+        ] + ([("Outstation address", "outstation", str(d.outstation)), ("Master address", "master", str(d.master))] if dnp3 else [])
+        v = {k: tk.StringVar(value=val) for _, k, val in fields}
+        ttk.Label(f, text=f"Driver: {ch.driver} (set in the project file)", foreground=GREY).grid(row=0, column=0, columnspan=2, sticky="w")
+        for i, (label, k, _) in enumerate(fields, 1):
+            ttk.Label(f, text=label + ":").grid(row=i, column=0, sticky="w", pady=4, padx=(0, 12))
+            ttk.Entry(f, textvariable=v[k], width=40).grid(row=i, column=1, sticky="ew")
+        r = len(fields) + 1
+        ttk.Checkbutton(f, text="Include program-scoped tags", variable=prog).grid(row=r, column=1, sticky="w")
+        if dnp3:
+            ttk.Label(f, text="Point names (Name = AI.5, one per line):").grid(row=r + 1, column=0, sticky="nw", pady=4)
+            names.grid(row=r + 1, column=1, sticky="ew")
+
+        def ok():
+            def items(k):
+                return [x.strip() for x in v[k].get().split(",") if x.strip()]
+
+            try:
+                if not v["scan_ms"].get().strip().isdigit() or any(v[k].get().strip() and not v[k].get().strip().isdigit() for k in ("outstation", "master") if k in v):
+                    raise config_mod.ConfigError("scan time and DNP3 addresses must be numbers")
+                changes = {
+                    "name": v["name"].get().strip(), "path": v["path"].get().strip(), "scan_ms": int(v["scan_ms"].get()),
+                    "include": items("include") or None, "exclude": items("exclude") or None, "writable": items("writable") or None,
+                    "program_tags": True if prog.get() else None,
+                }
+                if changes["include"] == ["*"]:
+                    changes["include"] = None
+                if changes["scan_ms"] == 1000:
+                    changes["scan_ms"] = None
+                if dnp3:
+                    changes["outstation"], changes["master"] = int(v["outstation"].get()), int(v["master"].get())
+                    lines = [x for x in names.get("1.0", "end").splitlines() if x.strip()]
+                    pairs = [x.partition("=") for x in lines]
+                    if any(not p[1] for p in pairs):
+                        raise config_mod.ConfigError("point names need the form Name = AI.5")
+                    changes["names"] = {p[0].strip(): p[2].strip() for p in pairs} or None
+                config_mod.update_device(self.path, ch.name, d.name, changes, v["channel"].get().strip())
+            except (OSError, yaml.YAMLError, config_mod.ConfigError, ValueError) as e:
+                messagebox.showerror("Properties", f"Not saved:\n\n{e}", parent=win)
+                return
+            win.destroy()
+            log.info("%s properties changed", key)
+            self.reload()  # restarts the gateway if online
+            new = f"{v['channel'].get().strip()}.{v['name'].get().strip()}"
+            if new in self.dev_cfg:
+                self.tree.selection_set(new)
+
+        bar = ttk.Frame(f)
+        bar.grid(row=r + 2, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(bar, text="OK", command=ok).pack(side="left", padx=6)
+        ttk.Button(bar, text="Cancel", command=win.destroy).pack(side="left")
+        f.columnconfigure(1, weight=1)
+        win.bind("<Escape>", lambda e: win.destroy())
 
     def add_device(self) -> None:
         """Dialog to add a device; a channel name that does not exist yet creates that channel."""

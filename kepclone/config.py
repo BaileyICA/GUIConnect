@@ -186,6 +186,45 @@ def set_device_path(path: str | Path, channel: str, device: str, value: str) -> 
     _save(path, text[: node.start_mark.index] + json.dumps(value) + text[node.end_mark.index :])
 
 
+def _edit_mapping(text: str, node, changes: dict) -> str:
+    """Set keys on a YAML mapping node (None removes one), leaving every other key and its comments alone."""
+    if node.flow_style:  # {a: 1, b: 2} on one line: rewrite it whole
+        d = yaml.safe_load(text[node.start_mark.index : node.end_mark.index])
+        d = {k: v for k, v in {**d, **changes}.items() if v is not None}
+        return text[: node.start_mark.index] + json.dumps(d) + text[node.end_mark.index :]
+    pairs = node.value
+    e = node.end_mark.index
+    block_end = len(text) if e >= len(text) else text.rfind("\n", 0, e) + 1  # block ends are marked at the next token
+    ends = [text.rfind("\n", 0, k.start_mark.index) + 1 for k, _ in pairs[1:]] + [block_end]
+    known = {k.value: i for i, (k, _) in enumerate(pairs)}
+    indent = " " * (pairs[1] if len(pairs) > 1 else pairs[0])[0].start_mark.column
+    new = "".join(f"{indent}{k}: {json.dumps(v)}\n" for k, v in changes.items() if k not in known and v is not None)
+    if new:
+        text = text[:block_end] + ("" if text[:block_end].endswith("\n") or not text else "\n") + new + text[block_end:]
+    for k, i in sorted(known.items(), key=lambda kv: -kv[1]):
+        if k in changes:
+            v = changes[k]
+            line = "" if v is None and i else f"{k}: {json.dumps(v)}\n"  # the first key shares its line with "- "
+            start = pairs[i][0].start_mark.index
+            text = text[: start if line else ends[i - 1]] + line + text[ends[i] :]
+    return text
+
+
+def update_device(path: str | Path, channel: str, device: str, changes: dict, new_channel: str | None = None) -> None:
+    """Change any settings of one device, and optionally rename its channel; comments and layout are kept."""
+    path = Path(path)
+    with open(path, encoding="utf-8", newline="") as f:
+        text = f.read()
+    channels = _pick(yaml.compose(text), "channels")
+    node = _named(_pick(_named(channels, channel), "devices"), device)
+    if node is None:
+        raise ConfigError(f"{channel}.{device}: not in {path.name}; was the file edited? Reload it.")
+    text = _edit_mapping(text, node, changes)
+    if new_channel and new_channel != channel:
+        text = _edit_mapping(text, _named(_pick(yaml.compose(text), "channels"), channel), {"name": new_channel})
+    _save(path, text)
+
+
 def add_device(path: str | Path, channel: str, driver: str, name: str, address: str, outstation: int | None = None) -> None:
     """Add a device to the project file, creating the channel (with this driver) if it is new."""
     path = Path(path)

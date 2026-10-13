@@ -86,3 +86,21 @@ def test_set_device_path_refuses_invalid(tmp_path):
     with pytest.raises(config.ConfigError, match="host:port"):
         config.set_device_path(p, "R", "P", "h:notaport")
     assert p.read_text() == before and not list(tmp_path.glob("*.tmp"))
+
+
+def test_update_device_edits_adds_removes_and_renames(tmp_path):
+    p = tmp_path / "c.yaml"
+    p.write_bytes(
+        b"channels:\r\n  - name: L\r\n    driver: logix\r\n    devices:\r\n"
+        b"      - {name: A, path: 1.1.1.1}\r\n      - name: B\r\n        path: 10.0.0.1/0   # slot 0\r\n"
+        b"        scan_ms: 500\r\n        writable: [\"X*\"]\r\n"
+    )
+    config.update_device(p, "L", "A", {"scan_ms": 200, "program_tags": True})
+    config.update_device(p, "L", "B", {"name": "B2", "scan_ms": None, "writable": ["Y*", "Z"], "include": ["T*"]}, "M")
+    ch = config.load(p).channels[0]
+    a, b = ch.devices
+    assert ch.name == "M" and (a.scan_ms, a.program_tags) == (200, True)
+    assert (b.name, b.scan_ms, b.writable, b.include) == ("B2", 1000, ["Y*", "Z"], ["T*"])
+    assert b"# slot 0" in p.read_bytes()
+    with pytest.raises(config.ConfigError, match="scan_ms"):
+        config.update_device(p, "M", "A", {"scan_ms": 1})
