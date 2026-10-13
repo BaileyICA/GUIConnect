@@ -268,6 +268,7 @@ class App:
         m = tk.Menu(menu, tearoff=False)
         m.add_command(label="Open Project…", accelerator="Ctrl+O", command=self.ask_open)
         m.add_command(label="Reload Project", accelerator="F5", command=self.reload)
+        m.add_command(label="Add Channel / Device…", accelerator="Ctrl+N", command=self.add_device)
         m.add_command(label="Edit Project File", command=lambda: self._open_file(self.path))
         m.add_separator()
         m.add_command(label="Open Log Folder", command=lambda: self._open_file(self.path.parent))
@@ -286,6 +287,7 @@ class App:
         menu.add_cascade(label="Help", menu=m)
         r.config(menu=menu)
         r.bind_all("<Control-o>", lambda e: self.ask_open())
+        r.bind_all("<Control-n>", lambda e: self.add_device())
         r.bind_all("<F5>", lambda e: self.reload())
         r.bind_all("<Control-comma>", lambda e: self.show_settings())
         r.protocol("WM_DELETE_WINDOW", self.quit)
@@ -311,6 +313,7 @@ class App:
         self.tree.bind("<Double-1>", lambda e: self.change_address())
         self.tree_menu = tk.Menu(self.tree, tearoff=False)
         self.tree_menu.add_command(label="Go Online", command=self.toggle_online)
+        self.tree_menu.add_command(label="Add Channel / Device…", command=self.add_device)
         self.tree.bind("<Button-3>", self._tree_menu)
         top.add(left, weight=1)
 
@@ -670,6 +673,73 @@ class App:
         self.reload()
         if key in self.dev_cfg:
             self.tree.selection_set(key)
+
+    def add_device(self) -> None:
+        """Dialog to add a device; a channel name that does not exist yet creates that channel."""
+        if not self.cfg:
+            return
+        drivers = {c.name: c.driver for c in self.cfg.channels}
+        sel = self.tree.selection()
+        sel_ch = sel[0].removeprefix("ch:").split(".")[0] if sel else ""
+        win = tk.Toplevel(self.root)
+        win.title("Add Channel / Device")
+        win.transient(self.root)
+        win.grab_set()
+        f = ttk.Frame(win, padding=12)
+        f.pack(fill="both", expand=True)
+        v = {k: tk.StringVar() for k in ("channel", "driver", "device", "address", "outstation")}
+        v["channel"].set(sel_ch if sel_ch in drivers else "")
+        rows = [
+            ("Channel (pick one, or type a new name)", ttk.Combobox(f, textvariable=v["channel"], values=list(drivers), width=38)),
+            ("Driver (new channel only)", ttk.Combobox(f, textvariable=v["driver"], values=list(DRIVER_NAMES), state="readonly", width=38)),
+            ("Device name", ttk.Entry(f, textvariable=v["device"], width=40)),
+            ("Address (Logix: IP/slot, DNP3: host[:port])", ttk.Entry(f, textvariable=v["address"], width=40)),
+            ("DNP3 outstation address", ttk.Entry(f, textvariable=v["outstation"], width=40)),
+        ]
+        for i, (label, w) in enumerate(rows):
+            ttk.Label(f, text=label + ":").grid(row=i, column=0, sticky="w", pady=4, padx=(0, 12))
+            w.grid(row=i, column=1, sticky="ew")
+        driver_box, outstation_box = rows[1][1], rows[4][1]
+
+        def sync(*_):
+            known = drivers.get(v["channel"].get().strip())
+            if known:
+                v["driver"].set(known)
+            driver_box.configure(state="disabled" if known else "readonly")
+            outstation_box.configure(state="normal" if v["driver"].get() == "dnp3" else "disabled")
+
+        v["channel"].trace_add("write", sync)
+        v["driver"].trace_add("write", sync)
+        sync()
+
+        def ok():
+            channel, driver, outstation = v["channel"].get().strip(), v["driver"].get(), v["outstation"].get().strip()
+            try:
+                if not driver:
+                    raise config_mod.ConfigError("pick a driver for the new channel")
+                if driver == "dnp3" and not outstation.isdigit():
+                    raise config_mod.ConfigError("outstation must be a number")
+                config_mod.add_device(
+                    self.path, channel, driver, v["device"].get().strip(), v["address"].get().strip(),
+                    int(outstation) if driver == "dnp3" else None,
+                )
+            except (OSError, yaml.YAMLError, config_mod.ConfigError) as e:
+                messagebox.showerror("Add Channel / Device", f"Not added:\n\n{e}", parent=win)
+                return
+            win.destroy()
+            log.info("added %s.%s", channel, v["device"].get().strip())
+            self.reload()  # restarts the gateway if online
+            key = f"{channel}.{v['device'].get().strip()}"
+            if key in self.dev_cfg:
+                self.tree.selection_set(key)
+
+        bar = ttk.Frame(f)
+        bar.grid(row=len(rows), column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(bar, text="Add", command=ok).pack(side="left", padx=6)
+        ttk.Button(bar, text="Cancel", command=win.destroy).pack(side="left")
+        f.columnconfigure(1, weight=1)
+        win.bind("<Return>", lambda e: ok())
+        win.bind("<Escape>", lambda e: win.destroy())
 
     def tag_details(self) -> bool:
         path = self.table.focus()

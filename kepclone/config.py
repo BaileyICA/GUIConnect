@@ -165,23 +165,52 @@ def load(path: str | Path) -> Config:
     return Config(server=server, channels=channels, base_dir=path.parent)
 
 
+def _pick(mapping, key):
+    return next((v for k, v in getattr(mapping, "value", []) if getattr(k, "value", None) == key), None)
+
+
+def _named(seq, name):
+    return next((n for n in getattr(seq, "value", []) if getattr(_pick(n, "name"), "value", None) == name), None)
+
+
 def set_device_path(path: str | Path, channel: str, device: str, value: str) -> None:
     """Change one device's address in the project file, keeping its comments and layout."""
     path = Path(path)
     with open(path, encoding="utf-8", newline="") as f:
         text = f.read()
 
-    def pick(mapping, key):
-        return next((v for k, v in getattr(mapping, "value", []) if getattr(k, "value", None) == key), None)
-
-    def named(seq, name):
-        return next((n for n in getattr(seq, "value", []) if getattr(pick(n, "name"), "value", None) == name), None)
-
-    node = pick(named(pick(named(pick(yaml.compose(text), "channels"), channel), "devices"), device), "path")
+    node = _pick(_named(_pick(_named(_pick(yaml.compose(text), "channels"), channel), "devices"), device), "path")
     if node is None:
         raise ConfigError(f"{channel}.{device}: no path in {path.name}; was the file edited? Reload it.")
     # A JSON string is a valid YAML double-quoted scalar, whatever the value contains.
-    text = text[: node.start_mark.index] + json.dumps(value) + text[node.end_mark.index :]
+    _save(path, text[: node.start_mark.index] + json.dumps(value) + text[node.end_mark.index :])
+
+
+def add_device(path: str | Path, channel: str, driver: str, name: str, address: str, outstation: int | None = None) -> None:
+    """Add a device to the project file, creating the channel (with this driver) if it is new."""
+    path = Path(path)
+    with open(path, encoding="utf-8", newline="") as f:
+        text = f.read()
+    q = json.dumps
+    dev = [f"- name: {q(name)}", f"  path: {q(address)}"] + ([f"  outstation: {outstation}"] if outstation is not None else [])
+    channels = _pick(yaml.compose(text), "channels")
+    if not getattr(channels, "value", None):
+        raise ConfigError(f"no channels list in {path.name}; add the first channel by editing the file")
+    ch = _named(channels, channel)
+    if ch is None:
+        col = channels.value[0].start_mark.column - 2  # the item node starts after "- "
+        block, seq = [f"- name: {q(channel)}", f"  driver: {driver}", "  devices:"] + ["    " + ln for ln in dev], channels
+    else:
+        seq = _pick(ch, "devices")
+        if not getattr(seq, "value", None):
+            raise ConfigError(f"{channel} has no devices list in {path.name}; add the first device by editing the file")
+        col, block = seq.value[0].start_mark.column - 2, dev
+    at = text.rfind("\n", 0, seq.end_mark.index) + 1  # block ends are marked at the next token, so back up to its line start
+    new = "".join(" " * col + ln + "\n" for ln in block)
+    _save(path, text[:at] + ("" if at == 0 or text[at - 1] == "\n" else "\n") + new + text[at:])
+
+
+def _save(path: Path, text: str) -> None:
     tmp = path.with_name(path.name + ".tmp")
     with open(tmp, "w", encoding="utf-8", newline="") as f:
         f.write(text)
