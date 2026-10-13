@@ -43,6 +43,18 @@ Rebuild after code changes:
 .venv\Scripts\pyinstaller --noconfirm --onefile --hide-console hide-early --icon $PWD\kepclone\kepclone.ico --add-data "$PWD\kepclone\kepclone.ico;kepclone" --name GUIConnect --collect-all asyncua --workpath $env:TEMP\kepclone-build --specpath $env:TEMP\kepclone-build kepclone_exe.py
 ```
 
+## Installer
+
+`dist\GUIConnect-Setup.exe` is a one-file installer: no admin rights, no Python, nothing else to
+install (the exe bundles Python and all libraries). The wizard offers a desktop shortcut, a Start
+menu shortcut, and an optional Windows Firewall rule for TCP 4840 (asks for admin only if ticked).
+It installs to `%LOCALAPPDATA%\Programs\GUIConnect` with a starter `config.yaml` that upgrades and
+uninstall never overwrite or delete. Build it (installs Inno Setup via winget if missing):
+
+```powershell
+.\build-installer.ps1
+```
+
 ## Connecting a client
 
 - Endpoint: `opc.tcp://<host>:4840/kepclone`. Open TCP 4840 in Windows Firewall.
